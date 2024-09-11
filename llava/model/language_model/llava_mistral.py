@@ -54,6 +54,7 @@ class LlavaMistralForCausalLM(MistralForCausalLM, LlavaMetaForCausalLM):
     def get_model(self):
         return self.model
 
+    @torch.autocast(device_type="cuda")  # arranges the dtype of the input automatically
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -133,6 +134,9 @@ class LlavaMistralForCausalLM(MistralForCausalLM, LlavaMetaForCausalLM):
             )
         else:
             inputs_embeds = self.get_model().embed_tokens(inputs)
+        if "prompt_embeddings" in kwargs:
+            prompt_embeds = kwargs.pop("prompt_embeddings")
+            inputs_embeds = torch.cat((prompt_embeds.unsqueeze(0).to(inputs_embeds.device), inputs_embeds), dim=1).type(torch.bfloat16)
 
         return super().generate(
             position_ids=position_ids,

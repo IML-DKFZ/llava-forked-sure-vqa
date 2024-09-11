@@ -5,6 +5,7 @@ import torch.nn as nn
 from torch.utils.data import Sampler
 
 from transformers import Trainer
+from transformers.trainer import OPTIMIZER_NAME, SCHEDULER_NAME, SCALER_NAME
 from transformers.trainer import (
     is_sagemaker_mp_enabled,
     get_parameter_names,
@@ -12,6 +13,9 @@ from transformers.trainer import (
     ALL_LAYERNORM_LAYERS,
     logger,
 )
+from transformers.trainer_pt_utils import reissue_pt_warnings
+from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
+import warnings
 from typing import List, Optional
 
 
@@ -228,25 +232,54 @@ class LLaVATrainer(Trainer):
         return self.optimizer
 
     def _save_checkpoint(self, model, trial, metrics=None):
-        if getattr(self.args, 'tune_mm_mlp_adapter', False):
-            from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
-            checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+        from train import get_peft_state_maybe_zero_3, get_peft_state_non_lora_maybe_zero_3, \
+            get_peft_state_non_ia3_maybe_zero_3, get_peft_state_non_prompt_maybe_zero_3
 
-            run_dir = self._get_output_dir(trial=trial)
-            output_dir = os.path.join(run_dir, checkpoint_folder)
+        checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
 
-            # Only save Adapter
-            keys_to_match = ['mm_projector', 'vision_resampler']
-            if getattr(self.args, "use_im_start_end", False):
-                keys_to_match.extend(['embed_tokens', 'embed_in'])
+        run_dir = self._get_output_dir(trial=trial)
+        output_dir = os.path.join(run_dir, checkpoint_folder)
 
-            weight_to_save = get_mm_adapter_state_maybe_zero_3(self.model.named_parameters(), keys_to_match)
+        peft_save_dict = {
+            "lora": (get_peft_state_non_lora_maybe_zero_3, "non_lora_trainables.bin"),
+            "prompt": (get_peft_state_non_prompt_maybe_zero_3, "non_prompt_trainables.bin"),
+            "ia3": (get_peft_state_non_ia3_maybe_zero_3, "non_ia3_trainables.bin")
+        }
 
+        if getattr(self.args, 'lora_enable', False) or getattr(self.args, 'prompt_enable', False) or getattr(self.args,
+                                                                                                             'ia3_enable',
+                                                                                                             False):
+            if getattr(self.args, 'lora_enable', False):
+                peft_type = "lora"
+                state_dict = get_peft_state_maybe_zero_3(
+                    model.named_parameters(), self.args.lora_bias
+                )
+            else:
+                if getattr(self.args, 'prompt_enable', False):
+                    peft_type = "prompt"
+                elif getattr(self.args, 'ia3_enable', False):
+                    peft_type = "ia3"
+                from peft import get_peft_model_state_dict
+                state_dict = get_peft_model_state_dict(model)
+            non_peft_state_dict = peft_save_dict[peft_type][0](
+                model.named_parameters()
+            )
             if self.args.local_rank == 0 or self.args.local_rank == -1:
-                self.model.config.save_pretrained(output_dir)
-                torch.save(weight_to_save, os.path.join(output_dir, f'mm_projector.bin'))
+                model.config.save_pretrained(output_dir)
+                model.save_pretrained(output_dir, state_dict=state_dict)
+                torch.save(non_peft_state_dict, os.path.join(output_dir, peft_save_dict[peft_type][1]))
         else:
             super(LLaVATrainer, self)._save_checkpoint(model, trial, metrics)
+            return
+        torch.save(self.optimizer.state_dict(), os.path.join(output_dir, OPTIMIZER_NAME))
+        with warnings.catch_warnings(record=True) as caught_warnings:
+            torch.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, SCHEDULER_NAME))
+        reissue_pt_warnings(caught_warnings)
+        # if self.do_grad_scaling:
+        #     torch.save(self.scaler.state_dict(), os.path.join(output_dir, SCALER_NAME))
+        self.state.save_to_json(
+            os.path.join(output_dir, 'trainer_state.json'))  # need to save this otherwise it starts from scratch
+        self._rotate_checkpoints(use_mtime=True, output_dir=run_dir)
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         if getattr(self.args, 'tune_mm_mlp_adapter', False):

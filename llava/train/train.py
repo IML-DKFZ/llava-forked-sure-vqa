@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 import json
 import logging
 import pathlib
+from datetime import datetime
 from typing import Dict, Optional, Sequence, List
 
 import torch
@@ -29,6 +30,8 @@ import tokenizers
 
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 from torch.utils.data import Dataset
+
+from llava.model.language_model.llava_llama import LlavaPromptModel
 from llava.train.llava_trainer import LLaVATrainer
 
 from llava import conversation as conversation_lib
@@ -39,7 +42,7 @@ from PIL import Image
 
 
 local_rank = None
-
+logger = logging.getLogger("transformers")
 
 def rank0_print(*args):
     if local_rank == 0:
@@ -108,8 +111,12 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_dropout: float = 0.05
     lora_weight_path: str = ""
     lora_bias: str = "none"
+    prompt_enable: bool = False
+    prompt_num_tokens: int = 80
+    ia3_enable: bool = False
     mm_projector_lr: Optional[float] = None
     group_by_modality_length: bool = field(default=False)
+    save_init_weights: bool = field(default=True)
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -157,6 +164,23 @@ def get_peft_state_non_lora_maybe_zero_3(named_params, require_grad_only=True):
     if require_grad_only:
         to_return = {k: t for k, t in to_return.items() if t.requires_grad}
     to_return = {k: maybe_zero_3(v, ignore_status=True).cpu() for k, v in to_return.items()}
+    return to_return
+
+
+def get_peft_state_non_prompt_maybe_zero_3(named_params, require_grad_only=True):
+    to_return = {k: t for k, t in named_params if "prompt_encoder" not in k}
+    if require_grad_only:
+        to_return = {k: t for k, t in to_return.items() if t.requires_grad}
+    to_return = {k: maybe_zero_3(v, ignore_status=True).cpu() for k, v in to_return.items()}
+    return to_return
+
+
+def get_peft_state_non_ia3_maybe_zero_3(named_params, require_grad_only=True):
+    to_return = {k: t for k, t in named_params if "ia3_" not in k}
+    if require_grad_only:
+        to_return = {k: t for k, t in to_return.items() if t.requires_grad}
+    to_return = {k: maybe_zero_3(v, ignore_status=True).cpu() for k, v in to_return.items()}
+    print([k for k,_ in to_return.items()])
     return to_return
 
 
@@ -625,8 +649,8 @@ def preprocess(
         return preprocess_llama_2(sources, tokenizer, has_image=has_image)
     if conversation_lib.default_conversation.version.startswith("v1"):
         return preprocess_v1(sources, tokenizer, has_image=has_image)
-    if conversation_lib.default_conversation.version == "mpt":
-        return preprocess_mpt(sources, tokenizer, has_image=has_image)
+    # if conversation_lib.default_conversation.version == "mpt":
+    #     return preprocess_mpt(sources, tokenizer, has_image=has_image)
     # add end signal and concatenate together
     conversations = []
     for source in sources:
@@ -785,12 +809,20 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
                 data_collator=data_collator)
 
 
-def train(attn_implementation=None):
+def train(model_args, data_args, training_args, attn_implementation=None):
     global local_rank
+    os.makedirs(training_args.output_dir, exist_ok=True)
+    log_filename = datetime.now().strftime("/output_%Y-%m-%d_%H-%M-%S.log")
+    file_handler = logging.FileHandler(training_args.output_dir+log_filename)
+    logger.addHandler(file_handler)
+    logger.info("Seed set to: ", training_args.seed)
 
-    parser = transformers.HfArgumentParser(
-        (ModelArguments, DataArguments, TrainingArguments))
-    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    # Below code throws errors if we have NaN-like values in the gradients
+    torch.autograd.set_detect_anomaly(True)
+
+    # parser = transformers.HfArgumentParser(
+    #     (ModelArguments, DataArguments, TrainingArguments))
+    # model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     local_rank = training_args.local_rank
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
 
@@ -814,13 +846,12 @@ def train(attn_implementation=None):
         ))
 
     if model_args.vision_tower is not None:
-        if 'mpt' in model_args.model_name_or_path:
-            config = transformers.AutoConfig.from_pretrained(model_args.model_name_or_path, trust_remote_code=True)
-            config.attn_config['attn_impl'] = training_args.mpt_attn_impl
-            model = LlavaMptForCausalLM.from_pretrained(
+        if model_args.version == "mistral_instruct":
+            model = LlavaMistralForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
-                config=config,
                 cache_dir=training_args.cache_dir,
+                attn_implementation=attn_implementation,
+                torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
                 **bnb_model_from_pretrained_args
             )
         else:
@@ -874,22 +905,65 @@ def train(attn_implementation=None):
                 model.to(torch.float16)
         rank0_print("Adding LoRA adapters...")
         model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
 
-    if 'mpt' in model_args.model_name_or_path:
-        tokenizer = transformers.AutoTokenizer.from_pretrained(
-            model_args.model_name_or_path,
-            cache_dir=training_args.cache_dir,
-            model_max_length=training_args.model_max_length,
-            padding_side="right"
+    if training_args.prompt_enable:
+        from peft import PromptTuningConfig, get_peft_model
+
+        prompt_config = PromptTuningConfig(
+            peft_type="PROMPT_TUNING",
+            task_type="CAUSAL_LM",
+            num_virtual_tokens=training_args.prompt_num_tokens,
+            #token_dim=768,
         )
-    else:
-        tokenizer = transformers.AutoTokenizer.from_pretrained(
-            model_args.model_name_or_path,
-            cache_dir=training_args.cache_dir,
-            model_max_length=training_args.model_max_length,
-            padding_side="right",
-            use_fast=False,
+        if training_args.bits == 16:
+            if training_args.bf16:
+                model.to(torch.bfloat16)
+            if training_args.fp16:
+                model.to(torch.float16)
+        rank0_print("Adding prompt adapters...")
+        model = LlavaPromptModel(model, prompt_config)
+        model.print_trainable_parameters()
+
+    if training_args.ia3_enable:
+        from peft import IA3Config, get_peft_model
+
+        ia3_config = IA3Config(
+            task_type="CAUSAL_LM",
+            target_modules=["k_proj", "v_proj", "down_proj"],
+            feedforward_modules=["down_proj"]
         )
+        if training_args.bits == 16:
+            if training_args.bf16:
+                model.to(torch.bfloat16)
+            if training_args.fp16:
+                model.to(torch.float16)
+        rank0_print("Adding IA3...")
+        model = get_peft_model(model, ia3_config)
+        model.print_trainable_parameters()
+
+    # Make sure that the model is set to the correct dtype even when we dont use adapters
+    if training_args.bits == 16:
+        if training_args.bf16:
+            model.to(torch.bfloat16)
+        if training_args.fp16:
+            model.to(torch.float16)
+
+    # if 'mpt' in model_args.model_name_or_path:
+    #     tokenizer = transformers.AutoTokenizer.from_pretrained(
+    #         model_args.model_name_or_path,
+    #         cache_dir=training_args.cache_dir,
+    #         model_max_length=training_args.model_max_length,
+    #         padding_side="right"
+    #     )
+    # else:
+    tokenizer = transformers.AutoTokenizer.from_pretrained(
+        model_args.model_name_or_path,
+        cache_dir=training_args.cache_dir,
+        model_max_length=training_args.model_max_length,
+        padding_side="right",
+        use_fast=False,
+    )
 
     if model_args.version == "v0":
         if tokenizer.pad_token is None:
@@ -912,7 +986,7 @@ def train(attn_implementation=None):
             model_args=model_args,
             fsdp=training_args.fsdp
         )
-        
+
         vision_tower = model.get_vision_tower()
         vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
 
@@ -924,8 +998,10 @@ def train(attn_implementation=None):
         model.config.tokenizer_model_max_length = tokenizer.model_max_length
 
         model.config.tune_mm_mlp_adapter = training_args.tune_mm_mlp_adapter = model_args.tune_mm_mlp_adapter
+
+        # TODO: add a check for the case where we only wanna funetune the projector (freeze all the other layers but projector)
         if model_args.tune_mm_mlp_adapter:
-            model.requires_grad_(False)
+            #model.requires_grad_(False)
             for p in model.get_model().mm_projector.parameters():
                 p.requires_grad = True
 
@@ -958,11 +1034,50 @@ def train(attn_implementation=None):
 
     data_module = make_supervised_data_module(tokenizer=tokenizer,
                                               data_args=data_args)
+
+    # Save initial weights
+    if training_args.save_init_weights:
+        if training_args.lora_enable:
+            state_dict = get_peft_state_maybe_zero_3(
+                model.named_parameters(), training_args.lora_bias
+            )
+            non_lora_state_dict = get_peft_state_non_lora_maybe_zero_3(
+                model.named_parameters()
+            )
+            if training_args.local_rank == 0 or training_args.local_rank == -1:
+                model.config.save_pretrained(training_args.output_dir + '/init_weight')
+                model.save_pretrained(training_args.output_dir + '/init_weight', state_dict=state_dict)
+                torch.save(non_lora_state_dict, os.path.join(training_args.output_dir + '/init_weight', 'non_lora_trainables.bin'))
+        elif training_args.prompt_enable:
+            from peft import get_peft_model_state_dict
+            state_dict = get_peft_model_state_dict(model)
+            non_prompt_state_dict = get_peft_state_non_prompt_maybe_zero_3(
+                model.named_parameters()
+            )
+            if training_args.local_rank == 0 or training_args.local_rank == -1:
+                model.config.save_pretrained(training_args.output_dir)
+                model.save_pretrained(training_args.output_dir + '/init_weight', state_dict=state_dict)
+                torch.save(non_prompt_state_dict, os.path.join(training_args.output_dir + '/init_weight', 'non_prompt_trainables.bin'))
+        elif training_args.ia3_enable:
+            from peft import get_peft_model_state_dict
+            state_dict = get_peft_model_state_dict(model)
+            non_ia3_state_dict = get_peft_state_non_ia3_maybe_zero_3(
+                model.named_parameters()
+            )
+            if training_args.local_rank == 0 or training_args.local_rank == -1:
+                model.config.save_pretrained(training_args.output_dir)
+                model.save_pretrained(training_args.output_dir + '/init_weight', state_dict=state_dict)
+                torch.save(non_ia3_state_dict, os.path.join(training_args.output_dir + '/init_weight', 'non_ia3_trainables.bin'))
+
     trainer = LLaVATrainer(model=model,
                     tokenizer=tokenizer,
                     args=training_args,
                     **data_module)
 
+    # if we are conducting full finetuning check if multi gpu run is activated (deepspeed)
+    logger.info(f'Is deepspeed(multi-gpu training) enabled: {trainer.is_deepspeed_enabled}')
+    requires_grad = [name for name, param in model.named_parameters() if param.requires_grad]
+    logger.info(f"Params that require grad: {requires_grad}")
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)
     else:
@@ -982,6 +1097,26 @@ def train(attn_implementation=None):
             model.config.save_pretrained(training_args.output_dir)
             model.save_pretrained(training_args.output_dir, state_dict=state_dict)
             torch.save(non_lora_state_dict, os.path.join(training_args.output_dir, 'non_lora_trainables.bin'))
+    elif training_args.prompt_enable:
+        from peft import get_peft_model_state_dict
+        state_dict = get_peft_model_state_dict(model)
+        non_prompt_state_dict = get_peft_state_non_prompt_maybe_zero_3(
+            model.named_parameters()
+        )
+        if training_args.local_rank == 0 or training_args.local_rank == -1:
+            model.config.save_pretrained(training_args.output_dir)
+            model.save_pretrained(training_args.output_dir, state_dict=state_dict)
+            torch.save(non_prompt_state_dict, os.path.join(training_args.output_dir, 'non_prompt_trainables.bin'))
+    elif training_args.ia3_enable:  # check here
+        from peft import get_peft_model_state_dict
+        state_dict = get_peft_model_state_dict(model)
+        non_ia3_state_dict = get_peft_state_non_ia3_maybe_zero_3(
+            model.named_parameters()
+        )
+        if training_args.local_rank == 0 or training_args.local_rank == -1:
+            model.config.save_pretrained(training_args.output_dir)
+            model.save_pretrained(training_args.output_dir, state_dict=state_dict)
+            torch.save(non_ia3_state_dict, os.path.join(training_args.output_dir, 'non_ia3_trainables.bin'))
     else:
         safe_save_model_for_hf_trainer(trainer=trainer,
                                        output_dir=training_args.output_dir)

@@ -17,12 +17,14 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+from peft.utils import _prepare_prompt_learning_config
 
 from transformers import AutoConfig, AutoModelForCausalLM, \
-                         LlamaConfig, LlamaModel, LlamaForCausalLM
+                         LlamaConfig, LlamaModel, LlamaForCausalLM, PreTrainedModel
 
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.generation.utils import GenerateOutput
+from peft import PeftConfig, PeftModelForCausalLM
 
 from ..llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
 
@@ -36,6 +38,62 @@ class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
 
     def __init__(self, config: LlamaConfig):
         super(LlavaLlamaModel, self).__init__(config)
+
+
+class LlavaPromptModel(PeftModelForCausalLM):
+    def __init__(self, model: PreTrainedModel, peft_config: PeftConfig):
+        model_config = getattr(model, "config", {"model_type": "custom"})
+        if hasattr(model_config, "to_dict"):
+            model_config = model_config.to_dict()
+        peft_config.base_model_name_or_path = model.__dict__.get("name_or_path", None)
+
+        peft_config = _prepare_prompt_learning_config(peft_config, model_config)
+        super().__init__(model, peft_config)
+
+    @torch.autocast(device_type="cuda")  # arranges the dtype of the input automatically
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        images: Optional[torch.FloatTensor] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple, CausalLMOutputWithPast]:
+        if inputs_embeds is None:
+            #print("prepare_inputs_labels_for_multimodal")
+            (
+                _,
+                position_ids,
+                attention_mask,
+                past_key_values,
+                inputs_embeds,
+                labels
+            ) = self.base_model.prepare_inputs_labels_for_multimodal(
+                input_ids,
+                position_ids,
+                attention_mask,
+                past_key_values,
+                labels,
+                images
+            )
+        return super().forward(input_ids=input_ids,
+                               attention_mask=attention_mask,
+                               position_ids=position_ids,
+                               past_key_values=past_key_values,
+                               inputs_embeds=inputs_embeds,
+                               labels=labels,
+                               use_cache=use_cache,
+                               output_attentions=output_attentions,
+                               output_hidden_states=output_hidden_states,
+                               return_dict=return_dict)
+
+
 
 
 class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
@@ -54,6 +112,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
     def get_model(self):
         return self.model
 
+    @torch.autocast(device_type="cuda")  # arranges the dtype of the input automatically
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -133,6 +192,9 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             )
         else:
             inputs_embeds = self.get_model().embed_tokens(inputs)
+        if "prompt_embeddings" in kwargs:
+            prompt_embeds = kwargs.pop("prompt_embeddings")
+            inputs_embeds = torch.cat((prompt_embeds.unsqueeze(0).to(inputs_embeds.device), inputs_embeds), dim=1).type(torch.bfloat16)
 
         return super().generate(
             position_ids=position_ids,

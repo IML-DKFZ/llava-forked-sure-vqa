@@ -41,6 +41,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
         )
     else:
         kwargs['torch_dtype'] = torch.float16
+        #kwargs['torch_dtype'] = torch.bfloat16
 
     if use_flash_attn:
         kwargs['attn_implementation'] = 'flash_attention_2'
@@ -54,7 +55,14 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             lora_cfg_pretrained = LlavaConfig.from_pretrained(model_path)
             tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
             print('Loading LLaVA from base model...')
-            model = LlavaLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, **kwargs)
+
+            if lora_cfg_pretrained.model_type == "llava_mistral":
+                model = LlavaMistralForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True,
+                                                                config=lora_cfg_pretrained, **kwargs)
+            else:
+                model = LlavaLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True,
+                                                              config=lora_cfg_pretrained, **kwargs)
+
             token_num, tokem_dim = model.lm_head.out_features, model.lm_head.in_features
             if model.lm_head.weight.shape[0] != token_num:
                 model.lm_head.weight = torch.nn.Parameter(torch.empty(token_num, tokem_dim, device=model.device, dtype=model.dtype))
@@ -84,6 +92,80 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             print('Merging LoRA weights...')
             model = model.merge_and_unload()
             print('Model is loaded...')
+        elif 'prompt' in model_name.lower():
+            print(model_base)
+            prompt_cfg_pretrained = AutoConfig.from_pretrained(model_path)
+            tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
+            print('Loading LLaVA from base model...')
+
+            if prompt_cfg_pretrained.model_type == "llava_mistral":
+                model = LlavaMistralForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True,
+                                                                config=prompt_cfg_pretrained, **kwargs)
+            else:
+                model = LlavaLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True,
+                                                              config=prompt_cfg_pretrained, **kwargs)
+
+            token_num, tokem_dim = model.lm_head.out_features, model.lm_head.in_features
+            if model.lm_head.weight.shape[0] != token_num:
+                model.lm_head.weight = torch.nn.Parameter(
+                    torch.empty(token_num, tokem_dim, device=model.device, dtype=model.dtype))
+                model.model.embed_tokens.weight = torch.nn.Parameter(
+                    torch.empty(token_num, tokem_dim, device=model.device, dtype=model.dtype))
+
+            print('Loading additional LLaVA weights...')
+            non_prompt_trainables = torch.load(os.path.join(model_path, 'non_prompt_trainables.bin'),
+                                               map_location='cpu')
+            non_prompt_trainables = {(k[11:] if k.startswith('base_model.') else k): v for k, v in
+                                     non_prompt_trainables.items()}
+
+            if any(k.startswith('model.model.') for k in non_prompt_trainables):
+                non_prompt_trainables = {(k[6:] if k.startswith('model.') else k): v for k, v in
+                                         non_prompt_trainables.items()}
+            print(non_prompt_trainables.keys())
+            model.load_state_dict(non_prompt_trainables, strict=False, assign=True)
+            model.to(torch.float16)
+
+
+        elif 'ia3' in model_name.lower():
+            ia3_cfg_pretrained = AutoConfig.from_pretrained(model_path)
+            tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
+            print('Loading LLaVA from base model...')
+
+            if ia3_cfg_pretrained.model_type == "llava_mistral":
+                model = LlavaMistralForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True,
+                                                                config=ia3_cfg_pretrained, **kwargs)
+            else:
+                model = LlavaLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True,
+                                                              config=ia3_cfg_pretrained, **kwargs)
+
+            token_num, tokem_dim = model.lm_head.out_features, model.lm_head.in_features
+            if model.lm_head.weight.shape[0] != token_num:
+                model.lm_head.weight = torch.nn.Parameter(
+                    torch.empty(token_num, tokem_dim, device=model.device, dtype=model.dtype))
+                model.model.embed_tokens.weight = torch.nn.Parameter(
+                    torch.empty(token_num, tokem_dim, device=model.device, dtype=model.dtype))
+
+            print('Loading additional LLaVA weights...')
+            non_ia3_trainables = torch.load(os.path.join(model_path, 'non_ia3_trainables.bin'),
+                                            map_location='cpu')
+            non_ia3_trainables = {(k[11:] if k.startswith('base_model.') else k): v for k, v in
+                                  non_ia3_trainables.items()}
+
+            if any(k.startswith('model.model.') for k in non_ia3_trainables):
+                non_ia3_trainables = {(k[6:] if k.startswith('model.') else k): v for k, v in
+                                      non_ia3_trainables.items()}
+            print(non_ia3_trainables.keys())
+            model.load_state_dict(non_ia3_trainables, strict=False)
+
+            from peft import PeftModel
+            print('Loading IA3 weights...')
+            model = PeftModel.from_pretrained(model, model_path)
+            print('Merging IA3 weights...')
+            model = model.merge_and_unload()
+            print('Model is loaded...')
+            # print('Convert to FP16...')
+            # model.to(torch.bfloat16)
+
         elif model_base is not None:
             # this may be mm projector only
             print('Loading LLaVA from base model...')
@@ -94,9 +176,20 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                 cfg_pretrained = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
                 model = LlavaMptForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=cfg_pretrained, **kwargs)
             else:
-                tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
+                # tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
+                if "finetune_full" in model_name:
+                    tokenizer = AutoTokenizer.from_pretrained(os.getenv('LLAVA_MED_MODEL_PATH'), use_fast=False)
+                else:
+                    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
+
                 cfg_pretrained = AutoConfig.from_pretrained(model_path)
-                model = LlavaLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=cfg_pretrained, **kwargs)
+
+                if cfg_pretrained.model_type == "llava_mistral":
+                    model = LlavaMistralForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True,
+                                                                    config=cfg_pretrained, **kwargs)
+                else:
+                    model = LlavaLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True,
+                                                                  config=cfg_pretrained, **kwargs)
 
             mm_projector_weights = torch.load(os.path.join(model_path, 'mm_projector.bin'), map_location='cpu')
             mm_projector_weights = {k: v.to(torch.float16) for k, v in mm_projector_weights.items()}
